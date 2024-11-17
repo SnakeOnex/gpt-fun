@@ -1,6 +1,7 @@
 # import torch, torch.nn as nn, torch.nn.functional as F, time
 import time
 from tinygrad import Tensor, nn, dtypes
+from tinygrad import TinyJit
 from dataclasses import dataclass
 from einops import rearrange
 
@@ -90,7 +91,7 @@ class TinyGPT():
 
 if __name__ == "__main__":
     # with open("shakespear.txt", "r") as f: text = f.read()
-    with open("enwik9", "rb") as f: text = f.read()[:1000]
+    with open("enwik9", "rb") as f: text = f.read()[:10000]
     chars = sorted(list(set(text)))
     char2idx = {c: i for i, c in enumerate(chars)}
     idx2char = {i: c for i, c in enumerate(chars)}
@@ -102,20 +103,25 @@ if __name__ == "__main__":
     batch_size = 128
     block_size = 32
 
-    idxs = Tensor.randint((batch_size,), low=0, high=len(tokens) - block_size)
-    for idx in idxs:
-        print(idx.numpy())
-        # print(tokens[idx:idx+10].numpy())
-        print(f"{idx.ndim=}, {tokens.ndim=}")
-        print(type(idx))
-        # print(tokens.gather(0, Tensor.arange(idx.item(), idx.item()+10)).numpy())
-        print(tokens[idx.item():idx.item()+10].numpy().shape)
-
     def get_batch():
         idxs = Tensor.randint((batch_size,), low=0, high=len(tokens) - block_size)
         x = Tensor.stack(*[tokens[idx.item():idx.item()+block_size] for idx in idxs])
         y = Tensor.stack(*[tokens[idx.item()+1:idx.item()+block_size+1] for idx in idxs])
         return x, y
+    # lightweight dataloader
+    def get_batch():
+        B = batch_size
+        T = block_size
+        assert B*T+1 <= len(tokens), "not enough tokens"
+        # for 338,025 tokens. E.g. with B=8 T=1024, this will yield 41 batches before looping
+        i = 0
+        while True:
+            x = tokens[i:i+B*T].view(B, T)
+            y = tokens[i+1:i+B*T+1].view(B, T)
+            yield x, y
+            i += B*T
+            if i + B*T + 1 >= len(tokens):
+                i = 0 # in prod we'd want to randomize the start point a biteturn x, y
 
     gpt = TinyGPT(vocab_size, TransformerConfig(n_layers=2, n_heads=8, n_embd=512, block_size=block_size))
     print(f"params: {sum(p.numel() for p in nn.state.get_parameters(gpt)) / 1e6:.1f}M")
@@ -123,15 +129,27 @@ if __name__ == "__main__":
     # loss_fn = nn.CrossEntropyLoss()
     optimizer = nn.optim.Adam(nn.state.get_parameters(gpt), lr=1e-4)
 
-    for i in range(100):
-        st = time.time()
-        x, y = get_batch()
+    loader = iter(get_batch())
+    x, y = next(loader)
+
+    def step():
+        Tensor.training = True
+        # x, y = get_batch()
+        # x, y = next(loader)
         preds = gpt(x)
         # loss = loss_fn(preds.view(-1, vocab_size), y.view(-1))
-        loss = preds.sparse_categorical_crossentropy(preds.view(-1, vocab_size), y.view(-1))
+        # print(f"{preds.shape=}, {y.shape=}")
+        loss = preds.sparse_categorical_crossentropy(y)
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        return loss
+
+    jit_step = TinyJit(step)
+
+    for i in range(100):
+        st = time.time()
+        loss = jit_step()
         dt = time.time() - st
         print(f"step={i}: loss={loss.item():.4f}, dt={dt:.2f}")
 
